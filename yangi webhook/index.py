@@ -5,7 +5,7 @@ import asyncio
 import logging
 import contextvars
 
-import asyncpg
+import aiohttp
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -19,89 +19,154 @@ logging.basicConfig(level=logging.INFO)
 # --- ENV (Vercel Settings -> Environment Variables) ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-DATABASE_URL = os.environ["DATABASE_URL"]
+TURSO_URL = os.environ["TURSO_URL"]      # libsql://xxx.turso.io
+TURSO_TOKEN = os.environ["TURSO_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]  # faqat A-Z a-z 0-9 _ - belgilari
 
 app = FastAPI()
 dp = Dispatcher()
 
 # =====================================================================
-#  DATABASE (Postgres, har so'rovga bitta ulanish)
+#  DATABASE (SQLite — Turso bulutida, HTTP orqali)
 # =====================================================================
-_conn: contextvars.ContextVar = contextvars.ContextVar("conn")
+_http: contextvars.ContextVar = contextvars.ContextVar("http")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT UNIQUE,
-    username TEXT,
-    viewed INTEGER DEFAULT 0,
-    join_date DATE DEFAULT CURRENT_DATE
-);
-CREATE TABLE IF NOT EXISTS films(
-    id SERIAL PRIMARY KEY,
-    title TEXT,
-    file_id TEXT,
-    code TEXT UNIQUE,
-    views INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS channels(
-    id SERIAL PRIMARY KEY,
-    chat_id BIGINT UNIQUE,
-    title TEXT,
-    join_url TEXT
-);
-CREATE TABLE IF NOT EXISTS temp_approved_subs(
-    user_id BIGINT,
-    chat_id BIGINT,
-    PRIMARY KEY (user_id, chat_id)
-);
-CREATE TABLE IF NOT EXISTS series(
-    id SERIAL PRIMARY KEY,
-    code TEXT,
-    title TEXT,
-    part INTEGER,
-    file_id TEXT
-);
-CREATE TABLE IF NOT EXISTS admin_state(
-    user_id BIGINT PRIMARY KEY,
-    data TEXT
-);
-"""
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE,
+        username TEXT,
+        viewed INTEGER DEFAULT 0,
+        join_date DATE DEFAULT CURRENT_DATE
+    )""",
+    """CREATE TABLE IF NOT EXISTS films(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        file_id TEXT,
+        code TEXT UNIQUE,
+        views INTEGER DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS channels(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER UNIQUE,
+        title TEXT,
+        join_url TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS temp_approved_subs(
+        user_id INTEGER,
+        chat_id INTEGER,
+        PRIMARY KEY (user_id, chat_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS series(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT,
+        title TEXT,
+        part INTEGER,
+        file_id TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS admin_state(
+        user_id INTEGER PRIMARY KEY,
+        data TEXT
+    )""",
+]
 
 
-async def q_one(sql, *args):
-    return await _conn.get().fetchrow(sql, *args)
+def _pipeline_url():
+    url = TURSO_URL
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+    return url.rstrip("/") + "/v2/pipeline"
+
+
+def _enc(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    return {"type": "text", "value": str(v)}
+
+
+def _dec(cell):
+    t = cell.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(cell["value"])
+    if t == "float":
+        return float(cell["value"])
+    return cell.get("value")
+
+
+async def _pipeline(stmts):
+    reqs = [
+        {"type": "execute", "stmt": {"sql": s, "args": [_enc(a) for a in args]}}
+        for s, args in stmts
+    ]
+    reqs.append({"type": "close"})
+    async with _http.get().post(
+        _pipeline_url(),
+        json={"requests": reqs},
+        headers={"Authorization": f"Bearer {TURSO_TOKEN}"},
+    ) as r:
+        data = await r.json()
+        if r.status != 200:
+            raise RuntimeError(f"Turso HTTP {r.status}: {data}")
+    out = []
+    for res in data["results"][:-1]:
+        if res.get("type") == "error":
+            raise RuntimeError(res["error"]["message"])
+        out.append(res["response"]["result"])
+    return out
+
+
+async def _run(sql, *args):
+    return (await _pipeline([(sql, args)]))[0]
 
 
 async def q_all(sql, *args):
-    return await _conn.get().fetch(sql, *args)
+    res = await _run(sql, *args)
+    cols = [c["name"] for c in res["cols"]]
+    return [dict(zip(cols, [_dec(c) for c in row])) for row in res["rows"]]
+
+
+async def q_one(sql, *args):
+    rows = await q_all(sql, *args)
+    return rows[0] if rows else None
 
 
 async def q_val(sql, *args):
-    return await _conn.get().fetchval(sql, *args)
+    row = await q_one(sql, *args)
+    return next(iter(row.values())) if row else None
 
 
 async def q_exec(sql, *args):
-    return await _conn.get().execute(sql, *args)
+    await _run(sql, *args)
+
+
+async def init_schema():
+    await _pipeline([(s, ()) for s in SCHEMA])
 
 
 # --- Admin holati (oldingi `state` lug'ati o'rniga) ---
 async def get_state(uid):
-    raw = await q_val("SELECT data FROM admin_state WHERE user_id=$1", uid)
+    raw = await q_val("SELECT data FROM admin_state WHERE user_id=?", uid)
     return json.loads(raw) if raw else {}
 
 
 async def set_state(uid, data):
     await q_exec(
-        "INSERT INTO admin_state(user_id, data) VALUES($1,$2) "
-        "ON CONFLICT (user_id) DO UPDATE SET data=EXCLUDED.data",
+        "INSERT INTO admin_state(user_id, data) VALUES(?,?) "
+        "ON CONFLICT (user_id) DO UPDATE SET data=excluded.data",
         uid, json.dumps(data),
     )
 
 
 async def clear_state(uid):
-    await q_exec("DELETE FROM admin_state WHERE user_id=$1", uid)
+    await q_exec("DELETE FROM admin_state WHERE user_id=?", uid)
 
 
 # Har xabar/callback oldidan admin holatini bir marta yuklaymiz -> `st`
@@ -193,7 +258,7 @@ async def check_subscription(bot: Bot, user_id):
 
         if not is_joined:
             temp = await q_one(
-                "SELECT 1 FROM temp_approved_subs WHERE user_id=$1 AND chat_id=$2",
+                "SELECT 1 FROM temp_approved_subs WHERE user_id=? AND chat_id=?",
                 user_id, ch["chat_id"],
             )
             if temp:
@@ -217,9 +282,9 @@ async def require_subscription(msg: types.Message, bot: Bot) -> bool:
 
 
 async def deliver_code(msg: types.Message, code: str):
-    movie = await q_one("SELECT title, file_id, views FROM films WHERE code=$1", code)
+    movie = await q_one("SELECT title, file_id, views FROM films WHERE code=?", code)
     if movie:
-        await q_exec("UPDATE films SET views = views + 1 WHERE code=$1", code)
+        await q_exec("UPDATE films SET views = views + 1 WHERE code=?", code)
         await msg.answer_video(
             movie["file_id"],
             caption=f"🎬 {movie['title']}\n👁 {movie['views'] + 1} marta ko‘rilgan",
@@ -227,7 +292,7 @@ async def deliver_code(msg: types.Message, code: str):
         return
 
     series = await q_one(
-        "SELECT title, COUNT(*) AS cnt FROM series WHERE code=$1 GROUP BY title", code
+        "SELECT title, COUNT(*) AS cnt FROM series WHERE code=? GROUP BY title", code
     )
     if series:
         await msg.answer(
@@ -245,7 +310,7 @@ async def deliver_code(msg: types.Message, code: str):
 @dp.message(CommandStart())
 async def start_cmd(msg: types.Message, bot: Bot):
     await q_exec(
-        "INSERT INTO users(user_id, username) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        "INSERT INTO users(user_id, username) VALUES(?,?) ON CONFLICT DO NOTHING",
         msg.from_user.id, msg.from_user.username,
     )
 
@@ -280,10 +345,10 @@ async def check_subs_again(callback: types.CallbackQuery, bot: Bot):
 
 @dp.chat_join_request()
 async def track_join_request(request: types.ChatJoinRequest):
-    exists = await q_one("SELECT 1 FROM channels WHERE chat_id=$1", request.chat.id)
+    exists = await q_one("SELECT 1 FROM channels WHERE chat_id=?", request.chat.id)
     if exists:
         await q_exec(
-            "INSERT INTO temp_approved_subs(user_id, chat_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            "INSERT INTO temp_approved_subs(user_id, chat_id) VALUES(?,?) ON CONFLICT DO NOTHING",
             request.from_user.id, request.chat.id,
         )
         logging.info("Join request %s -> %s yozib qo'yildi", request.from_user.id, request.chat.id)
@@ -322,7 +387,7 @@ async def add_or_delete_channel(msg: types.Message, st: dict):
     if text and text.startswith("/del"):
         try:
             del_id = int(text.replace("/del", "").strip())
-            await q_exec("DELETE FROM channels WHERE id=$1", del_id)
+            await q_exec("DELETE FROM channels WHERE id=?", del_id)
             await msg.answer(f"❌ Kanal o‘chirildi (ID: {del_id}).")
         except ValueError:
             await msg.answer("⚠️ /del ID formatida yuboring, ID raqam bo'lishi kerak.")
@@ -340,7 +405,7 @@ async def add_or_delete_channel(msg: types.Message, st: dict):
         if chat.username:
             join_url = f"https://t.me/{chat.username}"
             await q_exec(
-                "INSERT INTO channels(chat_id, title, join_url) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+                "INSERT INTO channels(chat_id, title, join_url) VALUES(?,?,?) ON CONFLICT DO NOTHING",
                 chat.id, chat.title, join_url,
             )
             await msg.answer(f"✅ Kanal qo‘shildi: {chat.title} ({join_url})")
@@ -359,7 +424,7 @@ async def get_invite_link(msg: types.Message, st: dict):
         await msg.answer("⚠️ Invite link https://t.me/+ yoki https://t.me/joinchat/ bilan boshlanishi kerak.")
         return
     await q_exec(
-        "INSERT INTO channels(chat_id, title, join_url) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+        "INSERT INTO channels(chat_id, title, join_url) VALUES(?,?,?) ON CONFLICT DO NOTHING",
         st["chat_id"], st["title"], join_url,
     )
     await set_state(msg.from_user.id, {"step": "manage_channels"})
@@ -471,13 +536,13 @@ async def single_movie_video(msg: types.Message, st: dict):
 @dp.message(lambda m, st: is_admin(m) and st.get("step") == "single_code")
 async def single_movie_code(msg: types.Message, st: dict):
     code = msg.text.strip()
-    if await q_one("SELECT 1 FROM films WHERE code=$1", code) or await q_one(
-        "SELECT 1 FROM series WHERE code=$1", code
+    if await q_one("SELECT 1 FROM films WHERE code=?", code) or await q_one(
+        "SELECT 1 FROM series WHERE code=?", code
     ):
         await msg.answer("❌ Bu kod mavjud. Boshqa kod kiriting.")
         return
     await q_exec(
-        "INSERT INTO films(title, file_id, code) VALUES($1,$2,$3)",
+        "INSERT INTO films(title, file_id, code) VALUES(?,?,?)",
         st["title"], st["file_id"], code,
     )
     await clear_state(msg.from_user.id)
@@ -525,14 +590,14 @@ async def series_videos(msg: types.Message, st: dict):
 @dp.message(lambda m, st: is_admin(m) and st.get("step") == "series_code")
 async def series_code(msg: types.Message, st: dict):
     code = msg.text.strip()
-    if await q_one("SELECT 1 FROM series WHERE code=$1", code) or await q_one(
-        "SELECT 1 FROM films WHERE code=$1", code
+    if await q_one("SELECT 1 FROM series WHERE code=?", code) or await q_one(
+        "SELECT 1 FROM films WHERE code=?", code
     ):
         await msg.answer("❌ Bu kod mavjud. Boshqa kod kiriting.")
         return
     for i, file_id in enumerate(st["videos"], start=1):
         await q_exec(
-            "INSERT INTO series(code, title, part, file_id) VALUES($1,$2,$3,$4)",
+            "INSERT INTO series(code, title, part, file_id) VALUES(?,?,?,?)",
             code, st["title"], i, file_id,
         )
     await clear_state(msg.from_user.id)
@@ -549,14 +614,14 @@ async def delete_movie_start(msg: types.Message):
 @dp.message(lambda m, st: is_admin(m) and st.get("step") == "delete")
 async def delete_movie_process(msg: types.Message):
     code = msg.text.strip()
-    film = await q_one("SELECT title FROM films WHERE code=$1", code)
-    series = await q_one("SELECT title FROM series WHERE code=$1 LIMIT 1", code)
+    film = await q_one("SELECT title FROM films WHERE code=?", code)
+    series = await q_one("SELECT title FROM series WHERE code=? LIMIT 1", code)
     if not film and not series:
         await msg.answer("❌ Bunday kodli kino topilmadi.")
     else:
         title = (film or series)["title"]
-        await q_exec("DELETE FROM films WHERE code=$1", code)
-        await q_exec("DELETE FROM series WHERE code=$1", code)
+        await q_exec("DELETE FROM films WHERE code=?", code)
+        await q_exec("DELETE FROM series WHERE code=?", code)
         await msg.answer(f"✅ '{title}' (kod: {code}) o‘chirildi.", reply_markup=admin_kb())
     await clear_state(msg.from_user.id)
 
@@ -566,7 +631,7 @@ async def send_series_part(call: types.CallbackQuery):
     _, rest = call.data.split(":", 1)
     code, part = rest.rsplit(":", 1)
     row = await q_one(
-        "SELECT file_id FROM series WHERE code=$1 AND part=$2", code, int(part)
+        "SELECT file_id FROM series WHERE code=? AND part=?", code, int(part)
     )
     if not row:
         await call.answer("❌ Qism topilmadi", show_alert=True)
@@ -611,8 +676,8 @@ async def webhook(request: Request):
 
     data = await request.json()
     bot = Bot(BOT_TOKEN)
-    conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
-    token = _conn.set(conn)
+    session = aiohttp.ClientSession()
+    token = _http.set(session)
     try:
         update = types.Update.model_validate(data, context={"bot": bot})
         await dp.feed_update(bot, update)
@@ -620,8 +685,8 @@ async def webhook(request: Request):
         # Xato bo'lsa ham 200 qaytaramiz, aks holda Telegram bir xil update'ni qayta yuboraveradi
         logging.exception("Update ishlashda xato")
     finally:
-        _conn.reset(token)
-        await conn.close()
+        _http.reset(token)
+        await session.close()
         await bot.session.close()
     return {"ok": True}
 
@@ -632,11 +697,12 @@ async def setup(request: Request, key: str = ""):
     if key != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
-    conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
-    try:
-        await conn.execute(SCHEMA)
-    finally:
-        await conn.close()
+    async with aiohttp.ClientSession() as session:
+        token = _http.set(session)
+        try:
+            await init_schema()
+        finally:
+            _http.reset(token)
 
     base = os.environ.get("PUBLIC_URL") or f"https://{request.headers['host']}"
     url = f"{base.rstrip('/')}/webhook"
@@ -649,7 +715,7 @@ async def setup(request: Request, key: str = ""):
         )
     finally:
         await bot.session.close()
-    return {"db": "ready", "webhook_set": ok, "url": url}
+    return {"db": "turso ready", "webhook_set": ok, "url": url}
 
 
 @app.get("/")
