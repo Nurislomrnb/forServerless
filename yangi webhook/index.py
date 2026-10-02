@@ -7,6 +7,7 @@ import contextvars
 
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -112,9 +113,10 @@ async def _pipeline(stmts):
         json={"requests": reqs},
         headers={"Authorization": f"Bearer {TURSO_TOKEN}"},
     ) as r:
-        data = await r.json()
+        text = await r.text()
         if r.status != 200:
-            raise RuntimeError(f"Turso HTTP {r.status}: {data}")
+            raise RuntimeError(f"Turso HTTP {r.status}: {text[:300]}")
+        data = json.loads(text)
     out = []
     for res in data["results"][:-1]:
         if res.get("type") == "error":
@@ -697,25 +699,34 @@ async def setup(request: Request, key: str = ""):
     if key != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
-    async with aiohttp.ClientSession() as session:
-        token = _http.set(session)
-        try:
-            await init_schema()
-        finally:
-            _http.reset(token)
-
-    base = os.environ.get("PUBLIC_URL") or f"https://{request.headers['host']}"
-    url = f"{base.rstrip('/')}/webhook"
-    bot = Bot(BOT_TOKEN)
+    step = "turso"
     try:
-        ok = await bot.set_webhook(
-            url,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=dp.resolve_used_update_types(),
+        async with aiohttp.ClientSession() as session:
+            token = _http.set(session)
+            try:
+                await init_schema()
+            finally:
+                _http.reset(token)
+
+        step = "telegram"
+        base = os.environ.get("PUBLIC_URL") or f"https://{request.headers['host']}"
+        url = f"{base.rstrip('/')}/webhook"
+        bot = Bot(BOT_TOKEN)
+        try:
+            ok = await bot.set_webhook(
+                url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
+        finally:
+            await bot.session.close()
+        return {"db": "turso ready", "webhook_set": ok, "url": url}
+    except Exception as e:
+        logging.exception("setup xato (%s)", step)
+        return JSONResponse(
+            {"ok": False, "failed_step": step, "error": f"{type(e).__name__}: {str(e)[:300]}"},
+            status_code=500,
         )
-    finally:
-        await bot.session.close()
-    return {"db": "turso ready", "webhook_set": ok, "url": url}
 
 
 @app.get("/")
